@@ -726,6 +726,21 @@ int ds4_gpu_dsv4_topk_mask_tensor(
 
 /* Single-token Q8_0 matvec storing BF16-rounded outputs; bitwise equal to
  * ds4_gpu_matmul_q8_0_tensor(n_tok=1) followed by V4.1 BF16 rounding. */
+/* V4.1 single-token router in one dispatch (sqrt-softplus scores, bias,
+ * top-k, normalized and scaled weights); bitwise equal to the generic
+ * ds4_gpu_router_select_tensor path with has_bias and no hash routing. */
+int ds4_gpu_dsv41_router_select_one(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              bias_offset,
+        uint32_t              n_expert,
+        uint32_t              n_expert_used,
+        float                 expert_weight_scale,
+        const ds4_gpu_tensor *logits);
+
 int ds4_gpu_matmul_q8_0_bf16_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,

@@ -291,3 +291,86 @@ kernel void kernel_dsv41_indexer_scores_packed(
     }
 }
 #endif
+
+
+// ---- V4.1 fused single-token router -------------------------------------------------------
+struct ds4_metal_args_dsv41_router {
+    uint  n_expert;   // <= 512
+    uint  n_used;     // <= 32
+    uint  has_bias;
+    float scale;
+    float sum_min;
+};
+
+kernel void kernel_dsv41_router_select_one(
+        constant ds4_metal_args_dsv41_router & args,
+        device const float * logits,
+        device const float * bias,
+        device       float * probs,
+        device     int32_t * selected,
+        device       float * weights,
+        threadgroup  char  * shmem [[threadgroup(0)]],
+        ushort col   [[thread_position_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort ntg   [[threads_per_threadgroup]]) {
+    threadgroup int32_t * idx = (threadgroup int32_t *) shmem;
+    threadgroup float   * val = (threadgroup float *) (idx + ntg);
+    threadgroup float   * prb = val + ntg;
+    const int width = (int) args.n_expert;
+
+    if (col < width) {
+        // kernel_unary softplus, then sqrt, then bin add
+        const float x  = logits[col];
+        const float ex = exp(x);
+        const float em = min(ex, 0.03125f);
+        const float poly = em*(1.0f - em*(0.5f - em*(1.0f/3.0f - 0.25f*em)));
+        const float sp = select(select(log(1 + ex), poly, ex < 0.03125f), x, x > 20);
+        const float p = sqrt(sp);
+        probs[col] = p;
+        prb[col] = p;
+        val[col] = args.has_bias ? p + bias[col] : p;
+    }
+    idx[col] = col;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC> (non-causal, no shuffle), i00 = 0
+    for (int k = 2; k <= ntg; k *= 2) {
+        for (int j = k / 2; j > 0; j /= 2) {
+            int ixj = col ^ j;
+            if (ixj > col) {
+                if ((col & k) == 0) {
+                    if (idx[col] >= width ||
+                       (idx[ixj] <  width && val[idx[col]] < val[idx[ixj]])) {
+                        const int t = idx[col]; idx[col] = idx[ixj]; idx[ixj] = t;
+                    }
+                } else {
+                    if (idx[ixj] >= width ||
+                       (idx[col] <  width && val[idx[col]] > val[idx[ixj]])) {
+                        const int t = idx[col]; idx[col] = idx[ixj]; idx[ixj] = t;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (sgitg == 0) {
+        const bool used = tiisg < args.n_used;
+        const int  sel  = used ? idx[tiisg] : 0;
+        const float w   = used ? prb[sel] : 0.0f;
+        // sum_rows over n_used threads: one simd_sum, the second stage adds zeros
+        float s = simd_sum(w);
+        s = clamp(s, args.sum_min, INFINITY);
+        // Divide and scale in separate steps, as the generic path does with two bin
+        // kernels; the threadgroup round trip keeps fast-math from folding them.
+        if (used) {
+            selected[tiisg] = sel;
+            val[tiisg] = w / s;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (used) {
+            weights[tiisg] = val[tiisg] * args.scale;
+        }
+    }
+}
