@@ -41482,6 +41482,21 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
             4096, 1024, groups, g->heads) && ds41_bf16(g->low, groups * DS4_N_LORA_O);
 }
 
+/* ds41_attention_low with the rounding stored by the projection itself. */
+static bool ds41_attention_low_fused(ds41_gpu_graph *g, const ds4_model *m,
+                                     const ds4_layer_weights *l) {
+    const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
+    const uint32_t group0 = g->tp_rank * groups;
+    uint64_t output_row;
+    if (!tensor_nbytes(l->attn_output_a->type, 4096, &output_row)) return false;
+    ds4_gpu_set_store_bf16(true);
+    const bool ok = ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
+        l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row,
+        4096, 1024, groups, g->heads) != 0;
+    ds4_gpu_set_store_bf16(false);
+    return ok;
+}
+
 static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l) {
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
@@ -41613,14 +41628,22 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
             l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
             g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
             g->selected_kv, 0, attended, NULL, 0,
-            heads, DS4_N_HEAD_DIM) ||
-        !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
+            heads, DS4_N_HEAD_DIM)) return false;
+#if defined(__APPLE__)
+    if (ds41_fuse_enabled()) {
+        ds4_gpu_set_store_bf16(true);
+        const bool ok = ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true);
+        ds4_gpu_set_store_bf16(false);
+        if (!ok) return false;
+    } else
+#endif
+    if (!ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
         !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
     if (projected) return true;
 #if defined(__APPLE__)
     /* one machine: no partial sum between the projection and its rounding */
     if (g->tp_world == 1 && ds41_fuse_enabled())
-        return ds41_attention_low(g, m, l) &&
+        return ds41_attention_low_fused(g, m, l) &&
             ds41_matmul(g->block, m, l->attn_output_b, g->low, true);
 #endif
     return ds41_attention_output(g, m, l) &&

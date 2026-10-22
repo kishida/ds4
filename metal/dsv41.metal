@@ -374,3 +374,28 @@ kernel void kernel_dsv41_router_select_one(
         }
     }
 }
+
+
+// BF16 rounding of every head dim followed by kernel_dsv41_rope on the 64-dim tail, in one pass.
+kernel void kernel_dsv41_bf16_rope(
+        constant ds4_metal_args_dsv41_rope &args,
+        device float *x,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint2 ntg2 [[threads_per_threadgroup]]) {    const uint ntg = ntg2.x;
+    const ulong base = ((ulong)group.y * args.heads + group.x) * args.width;
+    const uint nrot = args.width - 64u;
+    for (uint k = tid; k < nrot; k += ntg) {
+        x[base + k] = dsv41_bf16(x[base + k]);
+    }
+    if (tid < 32u) {
+        const uint lane = tid;
+        const float theta = float(args.start + group.y * args.stride) * args.frequencies[lane];
+        const float c = precise::cos(theta);
+        const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
+        const ulong i = base + nrot + 2u * lane;
+        const float re = dsv41_bf16(x[i]), im = dsv41_bf16(x[i + 1u]);
+        x[i] = dsv41_bf16(re * c - im * s);
+        x[i + 1u] = dsv41_bf16(re * s + im * c);
+    }
+}

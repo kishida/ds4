@@ -3389,7 +3389,8 @@ kernel void kernel_mul_mv_q4_K_dense_f32(
 // The generic GGML-style id matvec supports arbitrary routed expert ids.  Here
 // the id is always equal to the group number, so this wrapper keeps the exact
 // Q8_0 dot kernel but removes the id-buffer load and the CPU-side id table.
-kernel void kernel_dsv4_attn_out_low_q8_0_f32(
+template <bool B>
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_t(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,
         device const char * src1,
@@ -3433,7 +3434,7 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
         /*.r3   =*/ 1,
     };
 
-    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &>(
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &, B>(
         args0,
         src0_cur,
         src1_cur,
@@ -3443,6 +3444,10 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
         tiisg,
         sgitg);
 }
+
+typedef decltype(kernel_dsv4_attn_out_low_q8_0_f32_t<false>) kernel_dsv4_attn_out_low_q8_0_fn;
+template [[host_name("kernel_dsv4_attn_out_low_q8_0_f32")]] kernel kernel_dsv4_attn_out_low_q8_0_fn kernel_dsv4_attn_out_low_q8_0_f32_t<false>;
+template [[host_name("kernel_dsv4_attn_out_low_q8_0_bf16_f32")]] kernel kernel_dsv4_attn_out_low_q8_0_fn kernel_dsv4_attn_out_low_q8_0_f32_t<true>;
 
 kernel void kernel_dsv4_attn_out_low_q4_K_f32(
         constant ds4_metal_args_mul_mv_id & args,

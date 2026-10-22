@@ -1723,6 +1723,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_pipeline(const char *function_nam
 static id<MTLComputePipelineState> ds4_gpu_store_bf16_pipeline(id<MTLComputePipelineState> plain,
                                                                id<MTLComputePipelineState> __strong *cache,
                                                                const char *name);
+static bool g_store_bf16; /* defined with ds4_gpu_set_store_bf16 */
 static int ds4_gpu_warm_model_views(void);
 static double ds4_gpu_gib(uint64_t bytes);
 
@@ -27068,7 +27069,8 @@ int ds4_gpu_attention_output_low_q8_tensor(
                 .nr0 = 2,
             };
             id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32", 4);
+                ds4_gpu_get_mul_mv_pipeline(g_store_bf16 ? "kernel_dsv4_attn_out_low_q8_0_bf16_f32" :
+                                            "kernel_dsv4_attn_out_low_q8_0_f32", 4);
             ok = ds4_gpu_encode_attn_out_low_q8_direct(cb,
                                                          pipeline,
                                                          &args,
@@ -48000,7 +48002,11 @@ int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
         }
     });
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_rope");
+        const bool round_all = g_store_bf16;
+        static id<MTLComputePipelineState> rope_plain, rope_round;
+        if (!rope_plain) rope_plain = ds4_gpu_get_pipeline("kernel_dsv41_rope");
+        if (round_all && !rope_round) rope_round = ds4_gpu_get_pipeline("kernel_dsv41_bf16_rope");
+        id<MTLComputePipelineState> pipeline = round_all ? rope_round : rope_plain;
         if (!pipeline) return 0;
         struct {
             uint32_t width, heads, rows, start, inverse, stride;
@@ -48015,7 +48021,7 @@ int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:1];
         [enc dispatchThreadgroups:MTLSizeMake(heads, rows, 1)
-             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+             threadsPerThreadgroup:MTLSizeMake(round_all ? 256 : 32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 unit-magnitude RoPE");
     }
