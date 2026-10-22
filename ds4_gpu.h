@@ -724,6 +724,17 @@ int ds4_gpu_dsv4_topk_mask_tensor(
  * attention output projections, and DS4's tail-only RoPE.
  */
 
+/* Single-token Q8_0 matvec storing BF16-rounded outputs; bitwise equal to
+ * ds4_gpu_matmul_q8_0_tensor(n_tok=1) followed by V4.1 BF16 rounding. */
+int ds4_gpu_matmul_q8_0_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
+
 int ds4_gpu_matmul_q8_0_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,

@@ -41240,6 +41240,11 @@ static bool ds41_fuse_enabled(void) {
 
 static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
                         const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
+#if defined(__APPLE__)
+    if (round && weight->type == DS4_TENSOR_Q8_0 && ds41_fuse_enabled())
+        return ds4_gpu_matmul_q8_0_bf16_tensor(out, m->map, m->size, weight->abs_offset,
+            weight->dim[0], weight->dim[1], in) != 0;
+#endif
     return metal_graph_matmul_plain_tensor(out, m, weight, weight->dim[0], weight->dim[1], in, 1) &&
            (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
 }
@@ -41272,6 +41277,11 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
             ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(y);
         }
     } else {
+#if defined(__APPLE__)
+        if (count == 1 && round && weight->type == DS4_TENSOR_Q8_0 && ds41_fuse_enabled())
+            return ds4_gpu_matmul_q8_0_bf16_tensor(out, m->map, m->size, weight->abs_offset,
+                width, outputs, in) != 0;
+#endif
         ok = metal_graph_matmul_plain_tensor(out, m, weight, width, outputs, in, count);
     }
     return ok && (!round || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16));

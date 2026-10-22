@@ -19267,6 +19267,9 @@ int ds4_gpu_dsv4_topk_mask_tensor(
     return 1;
 }
 
+/* Set only around ds4_gpu_matmul_q8_0_bf16_tensor's single-token matvec. */
+static bool g_q8_mv_round_bf16;
+
 static int ds4_gpu_matmul_q8_0_legacy_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -19355,7 +19358,8 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             if (out_dim > 65536u) mv_dispatch.nsg = 8;
             mv_args.nr0 = mv_dispatch.nr0;
             id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
+                ds4_gpu_get_mul_mv_pipeline(g_q8_mv_round_bf16 ? "kernel_mul_mv_q8_0_bf16_f32" :
+                                            mv_dispatch.function_name, mv_dispatch.nsg);
             if (!pipeline) return 0;
 
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
@@ -19625,6 +19629,23 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
     return ds4_gpu_matmul_q8_0_tensor_impl(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok, false);
+}
+
+int ds4_gpu_matmul_q8_0_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x) {
+    /* The single-token path without the decode MPP route is the plain matvec,
+     * whose store is the only thing the rounding flag changes. */
+    g_q8_mv_round_bf16 = true;
+    const int ok = ds4_gpu_matmul_q8_0_legacy_tensor(out, model_map, model_size, weight_offset,
+                                                     in_dim, out_dim, x, 1, false, false);
+    g_q8_mv_round_bf16 = false;
+    return ok;
 }
 
 int ds4_gpu_qwen4_matmul_q8_0_tensor(
