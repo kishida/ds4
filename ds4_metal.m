@@ -1294,7 +1294,25 @@ static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
     return cb;
 }
 
+/* V4.1 concurrent region: see ds4_gpu_v41_concurrent_begin. */
+static bool g_v41_conc;
+static int g_v41_conc_group; /* 0 = none, 1 = group opened, 2 = inside group */
+
+static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder_raw(id<MTLCommandBuffer> cb);
+
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder_raw(cb);
+    if (enc && g_v41_conc && g_batch_encoder_concurrent && cb == g_batch_cb && enc == g_batch_enc &&
+        enc.dispatchType == MTLDispatchTypeConcurrent) {
+        if (g_v41_conc_group != 2) {
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            if (g_v41_conc_group == 1) g_v41_conc_group = 2;
+        }
+    }
+    return enc;
+}
+
+static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder_raw(id<MTLCommandBuffer> cb) {
     if (g_batch_cb && cb == g_batch_cb) {
         g_batch_has_work = YES;
         if (g_timeline_enabled && g_timeline_batch) {
@@ -22642,6 +22660,32 @@ int ds4_gpu_kv_norm_task_flush(void) {
 /* Run the deferred kv task in a concurrent encoder left open for the
  * caller's next dispatch (the q_b projection), so its ~9 us of serial work
  * hides under that stream.  End closes the section. */
+void ds4_gpu_v41_concurrent_begin(void) {
+    if (!g_batch_cb || g_batch_encoder_concurrent || g_timeline_enabled) return;
+    ds4_gpu_close_batch_encoder();
+    g_batch_encoder_concurrent = YES;
+    g_v41_conc = true;
+    g_v41_conc_group = 0;
+}
+
+void ds4_gpu_v41_concurrent_end(void) {
+    if (!g_v41_conc) return;
+    g_v41_conc = false;
+    g_v41_conc_group = 0;
+    if (g_batch_encoder_concurrent) {
+        ds4_gpu_close_batch_encoder();
+        g_batch_encoder_concurrent = NO;
+    }
+}
+
+void ds4_gpu_v41_group_begin(void) {
+    if (g_v41_conc) g_v41_conc_group = 1;
+}
+
+void ds4_gpu_v41_group_end(void) {
+    g_v41_conc_group = 0;
+}
+
 int ds4_gpu_kv_norm_task_begin_concurrent(void) {
     if (!g_kv_task.pending || !g_batch_cb || g_batch_encoder_concurrent) return 0;
     id<MTLComputePipelineState> pipeline =

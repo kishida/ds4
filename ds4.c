@@ -41656,6 +41656,41 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
+#if defined(__APPLE__)
+    static int conc = -1;
+    if (conc < 0) conc = getenv("DS4_V41_NO_CONCURRENT") == NULL;
+    if (conc && ds41_fuse_enabled() && g->tp_world == 1 && !g->streaming && !g->imatrix &&
+        l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0) {
+        bool ok;
+        ds4_gpu_v41_concurrent_begin();
+        ds4_gpu_v41_group_begin();
+        ok = ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) &&
+             ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) &&
+             ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true);
+        ds4_gpu_v41_group_end();
+        if (ok) {
+            ds4_gpu_v41_group_begin();
+            ok = ds4_gpu_dsv41_router_select_one(g->selected, g->route_weights, g->route_probs,
+                    m->map, m->size, bias->abs_offset, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                    DS4_EXPERT_WEIGHT_SCALE, g->route_logits) != 0;
+            ds4_gpu_set_store_bf16(true);
+            ok = ok && ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
+                                             DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
+            ds4_gpu_set_store_bf16(false);
+            ds4_gpu_v41_group_end();
+        }
+        ok = ok && ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true) &&
+             ds4_gpu_routed_moe_one_tensor(g->routed, g->gate, g->up, g->mid, g->experts,
+                m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+                gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+                DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, g->selected, g->route_weights,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->norm, NULL, il, true);
+        ds4_gpu_v41_concurrent_end();
+        (void)token;
+        return ok;
+    }
+#endif
     if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false)) return false;
 #if defined(__APPLE__)
     if (ds41_fuse_enabled()) {

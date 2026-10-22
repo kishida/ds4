@@ -162,6 +162,14 @@ void ds4_gpu_tp_flag_fold_request(uint32_t layer, uint32_t gate);
 void ds4_gpu_dsv4_qkv_norm_defer_kv_next(void);
 int ds4_gpu_kv_norm_task_pending(void);
 int ds4_gpu_kv_norm_task_flush(void);
+/* V4.1 decode: concurrent-dispatch region. Dispatches keep serial semantics
+ * (a buffer barrier before each) except inside a group, whose dispatches are
+ * independent and may overlap. Groups hold single-dispatch operations only. */
+void ds4_gpu_v41_concurrent_begin(void);
+void ds4_gpu_v41_concurrent_end(void);
+void ds4_gpu_v41_group_begin(void);
+void ds4_gpu_v41_group_end(void);
+
 int ds4_gpu_kv_norm_task_begin_concurrent(void);
 void ds4_gpu_kv_norm_task_end_concurrent(void);
 #endif
