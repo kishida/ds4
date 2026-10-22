@@ -195,15 +195,29 @@ typedef decltype(kernel_bin_fuse_impl<float, float, float>) kernel_bin_fuse_t;
 // Host-visible F32 binary op; function constants specialize it per use site.
 template [[host_name("kernel_bin_fuse_f32_f32_f32")]] kernel kernel_bin_fuse_t kernel_bin_fuse_impl<float, float, float>;
 
-kernel void kernel_add2_f32(
+// Same rounding as kernel_dsv41_bf16_linear.
+static inline float ds4_bin_bf16_round(float v) {
+    uint bits = as_type<uint>(v);
+    if ((bits & 0x7f800000u) != 0x7f800000u)
+        bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return as_type<float>(bits & 0xffff0000u);
+}
+
+template <bool B>
+kernel void kernel_add2_f32_t(
         constant ds4_metal_args_add3 &args,
         device const float *a,
         device const float *b,
         device float *out,
         uint i [[thread_position_in_grid]]) {
     if (i >= args.n) return;
-    out[i] = a[i] + b[i];
+    const float y = a[i] + b[i];
+    out[i] = B ? ds4_bin_bf16_round(y) : y;
 }
+
+typedef decltype(kernel_add2_f32_t<false>) kernel_add2_f32_fn;
+template [[host_name("kernel_add2_f32")]] kernel kernel_add2_f32_fn kernel_add2_f32_t<false>;
+template [[host_name("kernel_add2_bf16_f32")]] kernel kernel_add2_f32_fn kernel_add2_f32_t<true>;
 
 kernel void kernel_add3_f32(
         constant ds4_metal_args_add3 &args,

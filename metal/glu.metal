@@ -39,7 +39,16 @@ kernel void kernel_swiglu_f32(
     }
 }
 
-kernel void kernel_swiglu_flat_f32(
+// Same rounding as kernel_dsv41_bf16_linear.
+static inline float ds4_glu_bf16_round(float v) {
+    uint bits = as_type<uint>(v);
+    if ((bits & 0x7f800000u) != 0x7f800000u)
+        bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return as_type<float>(bits & 0xffff0000u);
+}
+
+template <bool B>
+kernel void kernel_swiglu_flat_f32_t(
         constant ds4_metal_args_glu & args,
         device const char * src0,
         device const char * src1,
@@ -59,5 +68,10 @@ kernel void kernel_swiglu_flat_f32(
     }
 
     const float silu = x0 / (1.0f + exp(-x0));
-    dst_f32[i] = silu*x1*args.alpha;
+    const float y = silu*x1*args.alpha;
+    dst_f32[i] = B ? ds4_glu_bf16_round(y) : y;
 }
+
+typedef decltype(kernel_swiglu_flat_f32_t<false>) kernel_swiglu_flat_f32_fn;
+template [[host_name("kernel_swiglu_flat_f32")]] kernel kernel_swiglu_flat_f32_fn kernel_swiglu_flat_f32_t<false>;
+template [[host_name("kernel_swiglu_flat_bf16_f32")]] kernel kernel_swiglu_flat_f32_fn kernel_swiglu_flat_f32_t<true>;

@@ -741,6 +741,11 @@ int ds4_gpu_dsv41_router_select_one(
         float                 expert_weight_scale,
         const ds4_gpu_tensor *logits);
 
+/* Metal: while on, ds4_gpu_hc_weighted_sum[_split]_tensor, ds4_gpu_hc_expand_split_tensor
+ * (HC=4), ds4_gpu_swiglu_tensor and ds4_gpu_add_tensor store BF16-rounded values
+ * (bitwise equal to the op followed by V4.1 BF16 rounding). */
+void ds4_gpu_set_store_bf16(bool on);
+
 int ds4_gpu_matmul_q8_0_bf16_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,

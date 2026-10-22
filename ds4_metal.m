@@ -1702,6 +1702,9 @@ static uint64_t ds4_gpu_effective_model_max_tensor_bytes(uint64_t map_size, uint
 }
 
 static id<MTLComputePipelineState> ds4_gpu_get_pipeline(const char *function_name);
+static id<MTLComputePipelineState> ds4_gpu_store_bf16_pipeline(id<MTLComputePipelineState> plain,
+                                                               id<MTLComputePipelineState> __strong *cache,
+                                                               const char *name);
 static int ds4_gpu_warm_model_views(void);
 static double ds4_gpu_gib(uint64_t bytes);
 
@@ -31213,7 +31216,11 @@ int ds4_gpu_swiglu_tensor(
         const NSUInteger groups = ((NSUInteger)n + nth - 1u) / nth;
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:g_swiglu_flat_pipeline];
+        static id<MTLComputePipelineState> sw_bf16;
+        id<MTLComputePipelineState> sw_pipeline =
+            ds4_gpu_store_bf16_pipeline(g_swiglu_flat_pipeline, &sw_bf16, "kernel_swiglu_flat_bf16_f32");
+        if (!sw_pipeline) return 0;
+        [enc setComputePipelineState:sw_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:gatebuf offset:ds4_gpu_tensor_offset(gate) atIndex:1];
         [enc setBuffer:upbuf offset:ds4_gpu_tensor_offset(up) atIndex:2];
@@ -31261,7 +31268,11 @@ int ds4_gpu_add_tensor(
         const NSUInteger groups = ((NSUInteger)n + nth - 1u) / nth;
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:g_add2_pipeline];
+        static id<MTLComputePipelineState> add_bf16;
+        id<MTLComputePipelineState> add_pipeline =
+            ds4_gpu_store_bf16_pipeline(g_add2_pipeline, &add_bf16, "kernel_add2_bf16_f32");
+        if (!add_pipeline) return 0;
+        [enc setComputePipelineState:add_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:abuf offset:ds4_gpu_tensor_offset(a) atIndex:1];
         [enc setBuffer:bbuf offset:ds4_gpu_tensor_offset(b) atIndex:2];
@@ -44716,6 +44727,22 @@ int ds4_gpu_hc_split_sinkhorn_tensor(
     return 1;
 }
 
+/* When set, the HC weighted sum, HC expand (HC=4), SwiGLU and add2 entry points
+ * dispatch their *_bf16 kernels, which round each stored value to BF16. */
+static bool g_store_bf16;
+
+void ds4_gpu_set_store_bf16(bool on) {
+    g_store_bf16 = on;
+}
+
+static id<MTLComputePipelineState> ds4_gpu_store_bf16_pipeline(id<MTLComputePipelineState> plain,
+                                                               id<MTLComputePipelineState> __strong *cache,
+                                                               const char *name) {
+    if (!g_store_bf16) return plain;
+    if (!*cache) *cache = ds4_gpu_get_pipeline(name);
+    return *cache;
+}
+
 static int ds4_gpu_hc_weighted_sum_strided(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *residual_hc,
@@ -44787,8 +44814,12 @@ static int ds4_gpu_hc_weighted_sum_strided(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
+        static id<MTLComputePipelineState> ws_bf16;
+        id<MTLComputePipelineState> ws_pipeline =
+            ds4_gpu_store_bf16_pipeline(g_hc_weighted_sum_pipeline, &ws_bf16, "kernel_dsv4_hc_weighted_sum_bf16");
+        if (!ws_pipeline) return 0;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:g_hc_weighted_sum_pipeline];
+        [enc setComputePipelineState:ws_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(residual_hc) atIndex:1];
         [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(weights) + (NSUInteger)weight_offset atIndex:2];
@@ -46086,9 +46117,12 @@ int ds4_gpu_hc_expand_split_tensor(
         };
         id<MTLComputePipelineState> expand_pipeline = g_hc_expand_pipeline;
         uint64_t n_elem = (uint64_t)n_embd * n_hc * n_tokens64;
+        if (g_store_bf16 && n_hc != 4) return 0;
         if (n_hc == 4) {
             expand_pipeline = ds4_gpu_hot_pipeline(g_dsv4_hc_expand4_pipeline,
                                                       "kernel_dsv4_hc_expand4");
+            static id<MTLComputePipelineState> ex_bf16;
+            expand_pipeline = ds4_gpu_store_bf16_pipeline(expand_pipeline, &ex_bf16, "kernel_dsv4_hc_expand4_bf16");
             n_elem = (uint64_t)n_embd * n_tokens64;
         }
         if (!expand_pipeline) {

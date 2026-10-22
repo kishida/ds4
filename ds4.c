@@ -41397,6 +41397,15 @@ static bool ds41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
     if (!getenv("DS4_CUDA_DISABLE_V41_POINTWISE_FUSION"))
         return ds4_gpu_dsv41_hc_sum(out, in, weights, DS4_N_EMBD, 1, split ? 24u : 4u);
 #endif
+#if defined(__APPLE__)
+    if (ds41_fuse_enabled()) {
+        ds4_gpu_set_store_bf16(true);
+        const bool ok = split ? ds4_gpu_hc_weighted_sum_split_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC) :
+            ds4_gpu_hc_weighted_sum_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC);
+        ds4_gpu_set_store_bf16(false);
+        return ok;
+    }
+#endif
     return (split ? ds4_gpu_hc_weighted_sum_split_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC) :
         ds4_gpu_hc_weighted_sum_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC)) &&
         ds41_bf16(out, DS4_N_EMBD);
@@ -41407,6 +41416,14 @@ static bool ds41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (!getenv("DS4_CUDA_DISABLE_V41_POINTWISE_FUSION"))
         return ds4_gpu_dsv41_hc_expand(out, block, residual, split, DS4_N_EMBD, 1);
+#endif
+#if defined(__APPLE__)
+    if (ds41_fuse_enabled() && DS4_N_HC == 4) {
+        ds4_gpu_set_store_bf16(true);
+        const bool ok = ds4_gpu_hc_expand_split_tensor(out, block, residual, split, DS4_N_EMBD, DS4_N_HC);
+        ds4_gpu_set_store_bf16(false);
+        return ok;
+    }
 #endif
     return ds4_gpu_hc_expand_split_tensor(out, block, residual, split, DS4_N_EMBD, DS4_N_HC) &&
         ds41_bf16(out, DS4_N_EMBD * DS4_N_HC);
@@ -41600,6 +41617,12 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
         !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
         !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
     if (projected) return true;
+#if defined(__APPLE__)
+    /* one machine: no partial sum between the projection and its rounding */
+    if (g->tp_world == 1 && ds41_fuse_enabled())
+        return ds41_attention_low(g, m, l) &&
+            ds41_matmul(g->block, m, l->attn_output_b, g->low, true);
+#endif
     return ds41_attention_output(g, m, l) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
            ds41_bf16(g->block, DS4_N_EMBD);
@@ -41681,13 +41704,22 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         if (shared_queued && balance_shared) shared_here = true;
     }
 #endif
-    if (shared_here && !shared_queued &&
-        (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
-        !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
-        !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
-                              DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
-        !ds41_bf16(g->shared_mid, DS4_N_FF_EXP) ||
-        !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
+    if (shared_here && !shared_queued) {
+        bool ok = ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) &&
+            ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true);
+#if defined(__APPLE__)
+        if (ok && ds41_fuse_enabled()) {
+            ds4_gpu_set_store_bf16(true);
+            ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
+                                       DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
+            ds4_gpu_set_store_bf16(false);
+        } else
+#endif
+        ok = ok && ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
+                                         DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+            ds41_bf16(g->shared_mid, DS4_N_FF_EXP);
+        if (!ok || !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true)) return false;
+    }
     bool routed_ok;
 #ifndef __APPLE__
     if (g->tp_world == 2) {
@@ -41723,6 +41755,14 @@ static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     if (!ds41_sum_partial(g, routed, il, DS4_TP_GATE_FFN)) return false;
+#if defined(__APPLE__)
+    if (!shared_owner && ds41_fuse_enabled()) {
+        ds4_gpu_set_store_bf16(true);
+        const bool ok = ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD) != 0;
+        ds4_gpu_set_store_bf16(false);
+        return ok;
+    }
+#endif
     return (shared_owner || ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) &&
         ds41_bf16(g->block, DS4_N_EMBD);
 }
