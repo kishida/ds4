@@ -404,6 +404,7 @@ static id<MTLComputePipelineState> g_moe_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_sum8_pipeline;
 static id<MTLComputePipelineState> g_mul_pipeline;
 static id<MTLComputePipelineState> g_rms_norm_pipeline;
+static id<MTLComputePipelineState> g_rms_norm_bf16_pipeline;
 static id<MTLComputePipelineState> g_rms_norm_plain_pipeline;
 static id<MTLComputePipelineState> g_add_rms_norm_pipeline;
 static id<MTLComputePipelineState> g_rms_norm_scale_pipeline;
@@ -7558,6 +7559,11 @@ int ds4_gpu_init(void) {
             return 0;
         }
         g_rms_norm_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        {
+            id<MTLFunction> fn_bf16 = [library newFunctionWithName:@"kernel_rms_norm_mul_bf16_f32_4"];
+            g_rms_norm_bf16_pipeline = fn_bf16 ?
+                [g_device newComputePipelineStateWithFunction:fn_bf16 error:nil] : nil;
+        }
         if (!g_rms_norm_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_rms_norm_mul_f32_4 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -11608,6 +11614,7 @@ void ds4_gpu_cleanup(void) {
         g_unary_fill_pipeline = nil;
         g_unary_fill_f16_pipeline = nil;
         g_rms_norm_pipeline = nil;
+        g_rms_norm_bf16_pipeline = nil;
         g_rms_norm_plain_pipeline = nil;
         g_add_rms_norm_pipeline = nil;
         g_rms_norm_scale_pipeline = nil;
@@ -22301,6 +22308,17 @@ int ds4_gpu_rms_norm_weight_tensor(
     return ds4_gpu_rms_norm_weight_rows_tensor(out, x, model_map, model_size, weight_offset, n, 1, eps);
 }
 
+static int ds4_gpu_rms_norm_weight_rows_impl(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps,
+        bool                    round_bf16);
+
 int ds4_gpu_rms_norm_weight_rows_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
@@ -22310,6 +22328,35 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         uint32_t                n,
         uint32_t                rows,
         float                   eps) {
+    return ds4_gpu_rms_norm_weight_rows_impl(out, x, model_map, model_size, weight_offset,
+                                             n, rows, eps, false);
+}
+
+int ds4_gpu_rms_norm_weight_rows_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!g_rms_norm_bf16_pipeline) return 0;
+    return ds4_gpu_rms_norm_weight_rows_impl(out, x, model_map, model_size, weight_offset,
+                                             n, rows, eps, true);
+}
+
+static int ds4_gpu_rms_norm_weight_rows_impl(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps,
+        bool                    round_bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (n == 0 || rows == 0 || (n & 3u) != 0) return 0;
 
@@ -22343,7 +22390,7 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         if (!cb) return 0;
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:g_rms_norm_pipeline];
+        [enc setComputePipelineState:round_bf16 ? g_rms_norm_bf16_pipeline : g_rms_norm_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:2];

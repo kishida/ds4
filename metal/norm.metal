@@ -16,7 +16,21 @@ struct ds4_metal_args_norm {
 // RMSNorm over one activation row, optionally fusing the learned weight
 // multiply. DS4 calls this before attention, before the FFN, and for plain
 // diagnostics that need normalized but unweighted rows.
-template <typename T, short F>
+// Same rounding as kernel_dsv41_bf16_linear: round-to-nearest-even into the
+// upper 16 bits for finite values, then truncate the low half.
+static inline float ds4_norm_bf16_round(float v) {
+    uint bits = as_type<uint>(v);
+    if ((bits & 0x7f800000u) != 0x7f800000u)
+        bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return as_type<float>(bits & 0xffff0000u);
+}
+
+static inline float4 ds4_norm_bf16_round(float4 v) {
+    return float4(ds4_norm_bf16_round(v.x), ds4_norm_bf16_round(v.y),
+                  ds4_norm_bf16_round(v.z), ds4_norm_bf16_round(v.w));
+}
+
+template <typename T, short F, bool B = false>
 kernel void kernel_rms_norm_fuse_impl(
         constant ds4_metal_args_norm & args,
         device const char * src0,
@@ -70,7 +84,11 @@ kernel void kernel_rms_norm_fuse_impl(
             y[i00] = (x[i00]*scale);
         }
         if (F == 2) {
-            y[i00] = (x[i00]*scale)*f0[i00];
+            if (B) {
+                y[i00] = ds4_norm_bf16_round((x[i00]*scale)*f0[i00]);
+            } else {
+                y[i00] = (x[i00]*scale)*f0[i00];
+            }
         }
         if (F == 3) {
             y[i00] = (x[i00]*scale)*f0[i00] + f1[i00];
@@ -83,6 +101,7 @@ typedef decltype(kernel_rms_norm_fuse_impl<float4, 1>) kernel_rms_norm_fuse_t;
 // Host-visible RMSNorm variants: plain norm and norm multiplied by weight.
 template [[host_name("kernel_rms_norm_f32_4")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 1>;
 template [[host_name("kernel_rms_norm_mul_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
+template [[host_name("kernel_rms_norm_mul_bf16_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2, true>;
 
 kernel void kernel_add_rms_norm_mul_f32_4(
         constant ds4_metal_args_norm & args,

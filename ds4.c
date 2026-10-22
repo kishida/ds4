@@ -41226,6 +41226,18 @@ static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
     return ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16) != 0;
 }
 
+/* Metal producer kernels that store BF16-rounded values directly; bitwise
+ * equal to producer + ds41_bf16. DS4_V41_NO_FUSE=1 restores the split form. */
+static bool ds41_fuse_enabled(void) {
+#if defined(__APPLE__)
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_V41_NO_FUSE") == NULL;
+    return on != 0;
+#else
+    return false;
+#endif
+}
+
 static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
                         const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
     return metal_graph_matmul_plain_tensor(out, m, weight, weight->dim[0], weight->dim[1], in, 1) &&
@@ -41358,6 +41370,11 @@ static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
     if (!getenv("DS4_CUDA_DISABLE_V41_POINTWISE_FUSION"))
         return ds4_gpu_dsv41_norm(out, in, m->map, m->size, weight->abs_offset,
             (uint32_t)weight->dim[0], 1, DS4_RMS_EPS);
+#endif
+#if defined(__APPLE__)
+    if (ds41_fuse_enabled())
+        return ds4_gpu_rms_norm_weight_rows_bf16_tensor(out, in, m->map, m->size,
+            weight->abs_offset, (uint32_t)weight->dim[0], 1, DS4_RMS_EPS) != 0;
 #endif
     return ds4_gpu_rms_norm_weight_tensor(out, in, m->map, m->size,
         weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) &&
@@ -41743,6 +41760,11 @@ static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
     if (!getenv("DS4_CUDA_DISABLE_V41_POINTWISE_FUSION"))
         return ds4_gpu_dsv41_norm(out, in, m->map, m->size, weight->abs_offset,
             (uint32_t)weight->dim[0], count, DS4_RMS_EPS);
+#endif
+#if defined(__APPLE__)
+    if (ds41_fuse_enabled())
+        return ds4_gpu_rms_norm_weight_rows_bf16_tensor(out, in, m->map, m->size,
+            weight->abs_offset, (uint32_t)weight->dim[0], count, DS4_RMS_EPS) != 0;
 #endif
     return ds4_gpu_rms_norm_weight_rows_tensor(out, in, m->map, m->size,
         weight->abs_offset, (uint32_t)weight->dim[0], count, DS4_RMS_EPS) &&
