@@ -48040,9 +48040,6 @@ int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
         (format != DS4_V41_BF16 && width % block) ||
         !dsv41_tensor_has_floats(x, (uint64_t)width * rows)) return 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    static int skip_bf16 = -1;
-    if (skip_bf16 < 0) skip_bf16 = getenv("DS4_V41_SKIP_BF16") != NULL;
-    if (skip_bf16 && format == DS4_V41_BF16) return 1;
     @autoreleasepool {
         const uint64_t count = (uint64_t)width * rows;
         const bool linear = format == DS4_V41_BF16 && count <= UINT32_MAX &&
