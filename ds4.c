@@ -42147,6 +42147,12 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    static int sp_on = -1;
+    if (sp_on < 0) sp_on = getenv("DS4_V41_STEP_PROFILE") != NULL;
+    static double sp_tot, sp_drain, sp_engram, sp_logits, sp_flush;
+    static int sp_n;
+    const double sp_t0 = sp_on ? now_sec() : 0.0;
+    double sp_t;
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
@@ -42169,16 +42175,22 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
-    const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
+    const bool queue_layers = (g->tp_world == 2 || (getenv("DS4_V41_SINGLE_QUEUE") && !g->streaming)) && !g->imatrix &&
         !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
+    /* Single machine: commit every layer as soon as it is encoded so the GPU
+     * runs it while the CPU encodes the next one, waiting only where the TP
+     * path drains (the layer-14 Engram input and the finished token). */
+    const bool commit_layers = queue_layers && g->tp_world != 2;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
         if (ok && ds41_engram_layer(il)) {
             const uint32_t i = il == 1 ? 0 : 1;
-            ok = (!overlap_engram || ds4_engram_reader_wait(g->engram_reader, i)) &&
-                ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
+            sp_t = sp_on ? now_sec() : 0.0;
+            ok = (!overlap_engram || ds4_engram_reader_wait(g->engram_reader, i));
+            if (sp_on) sp_engram += now_sec() - sp_t;
+            ok = ok && ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
         }
         if (ok) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -42191,7 +42203,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
         const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
+        sp_t = sp_on ? now_sec() : 0.0;
         if (drain && !ds4_gpu_end_commands()) ok = false;
+        else if (!drain && commit_layers && ok && !ds4_gpu_flush_commands()) ok = false;
+        if (sp_on) { if (drain) sp_drain += now_sec() - sp_t; else sp_flush += now_sec() - sp_t; }
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
@@ -42203,7 +42218,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
+    sp_t = sp_on ? now_sec() : 0.0;
     if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
+    if (sp_on) sp_logits += now_sec() - sp_t;
     /* Even a failed GPU layer must finish the reader before this graph (or
      * a borrowed row graph) can leave scope or reuse its host output rows. */
     if (overlap_engram && !ds4_engram_reader_wait(g->engram_reader, 1)) ok = false;
@@ -42211,8 +42228,31 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         g->valid = false;
         return false;
     }
+    if (logits) {
+        static const char *dump_dir = (const char *)1;
+        if (dump_dir == (const char *)1) dump_dir = getenv("DS4_V41_DUMP_DECODE_LOGITS");
+        if (dump_dir && dump_dir[0]) {
+            char dump_path[1024];
+            snprintf(dump_path, sizeof(dump_path), "%s/pos_%07u.f32", dump_dir, g->pos);
+            FILE *df = fopen(dump_path, "wb");
+            if (df) {
+                fwrite(logits, sizeof(float), DS4_N_VOCAB, df);
+                fclose(df);
+            }
+        }
+    }
     g->history = next_history;
     g->pos++;
+    if (sp_on) {
+        sp_tot += now_sec() - sp_t0;
+        if (++sp_n % 32 == 0) {
+            const double k = 1000.0 / sp_n;
+            fprintf(stderr, "ds4: v41 step profile n=%d avg ms: total %.2f drain-wait %.2f engram-wait %.2f "
+                    "logits %.2f flush %.2f other(encode) %.2f\n", sp_n, sp_tot * k, sp_drain * k,
+                    sp_engram * k, sp_logits * k, sp_flush * k,
+                    (sp_tot - sp_drain - sp_engram - sp_logits - sp_flush) * k);
+        }
+    }
     return true;
 }
 
