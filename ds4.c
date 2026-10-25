@@ -41667,13 +41667,25 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                              g->kv, 0, 512u * 4u) ||
         !ds41_attention_select(g, m, l, il)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
+    /* Metal: gather the selected rows straight into F16, the attention's
+     * staging format, so raw and compressed rows stage in one dispatch. */
+#if defined(__APPLE__)
+    const uint32_t comp_f16 = ds41_fuse_enabled();
+    if (n_comp && !(comp_f16 ?
+            ds4_gpu_dsv41_gather_kv_f16(g->selected_kv, g->compressed[owner],
+                                        g->selected_comp, n_comp, attended) :
+            ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
+                                    g->selected_comp, n_comp, attended))) return false;
+#else
+    const uint32_t comp_f16 = 0;
     if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
                                          g->selected_comp, n_comp, attended)) return false;
+#endif
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
     if (!ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
             l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
             g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
-            g->selected_kv, 0, attended, NULL, 0,
+            g->selected_kv, comp_f16, attended, NULL, 0,
             heads, DS4_N_HEAD_DIM)) return false;
 #if defined(__APPLE__)
     if (ds41_fuse_enabled()) {
