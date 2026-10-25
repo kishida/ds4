@@ -103,6 +103,69 @@ template [[host_name("kernel_rms_norm_f32_4")]]     kernel kernel_rms_norm_fuse_
 template [[host_name("kernel_rms_norm_mul_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
 template [[host_name("kernel_rms_norm_mul_bf16_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2, true>;
 
+// Two BF16 weighted RMSNorms of single rows with different widths in one dispatch; threadgroup r
+// normalizes row r. Each row replays kernel_rms_norm_mul_bf16_f32_4 with nth[r] threads (the count
+// the host would launch for it alone): threads past nth[r] only leave zero partials, which the
+// tree adds exactly, so the host launches max(nth) threads and both rows are bitwise unchanged.
+struct ds4_metal_args_dsv41_norm_pair {
+    uint  n[2];
+    uint  nth[2];
+    float eps;
+};
+
+kernel void kernel_dsv41_rms_norm_mul_bf16_pair_f32_4(
+        constant ds4_metal_args_dsv41_norm_pair & args,
+        device const float4 * x0,
+        device const float4 * w0,
+        device       float4 * y0,
+        device const float4 * x1,
+        device const float4 * w1,
+        device       float4 * y1,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint   row   [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    device const float4 * x = row ? x1 : x0;
+    device const float4 * w = row ? w1 : w0;
+    device       float4 * y = row ? y1 : y0;
+    const uint n = args.n[row];
+    const uint n4 = n >> 2;
+    const uint nth = args.nth[row];
+
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    float sumf = 0.0f;
+    if (tid < nth) {
+        for (uint i = tid; i < n4; i += nth) {
+            sumf += dot(x[i], x[i]);
+        }
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float mean  = sumf/(float)n;
+    const float scale = 1.0f/sqrt(mean + args.eps);
+
+    if (tid < nth) {
+        for (uint i = tid; i < n4; i += nth) {
+            y[i] = ds4_norm_bf16_round((x[i]*scale)*w[i]);
+        }
+    }
+}
+
 kernel void kernel_add_rms_norm_mul_f32_4(
         constant ds4_metal_args_norm & args,
         device const char * src0,

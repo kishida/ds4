@@ -770,6 +770,35 @@ int ds4_gpu_dsv41_hc_split_sum_norm_tensor(
         float                 hc_eps,
         float                 norm_eps);
 
+/* Two single-token BF16-storing Q8_0 matvecs of x in one dispatch; bitwise equal to two
+ * ds4_gpu_matmul_q8_0_bf16_tensor calls. */
+int ds4_gpu_dsv41_matmul_q8_0_bf16_pair_tensor(
+        ds4_gpu_tensor       *out_a,
+        ds4_gpu_tensor       *out_b,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              offset_a,
+        uint64_t              offset_b,
+        uint64_t              in_dim,
+        uint64_t              out_dim_a,
+        uint64_t              out_dim_b,
+        const ds4_gpu_tensor *x);
+
+/* Two single-row BF16 weighted RMSNorms in one dispatch; bitwise equal to two
+ * ds4_gpu_rms_norm_weight_rows_bf16_tensor calls with rows = 1. */
+int ds4_gpu_dsv41_rms_norm_bf16_pair_tensor(
+        ds4_gpu_tensor       *out_a,
+        const ds4_gpu_tensor *x_a,
+        uint64_t              weight_a,
+        uint32_t              n_a,
+        ds4_gpu_tensor       *out_b,
+        const ds4_gpu_tensor *x_b,
+        uint64_t              weight_b,
+        uint32_t              n_b,
+        const void           *model_map,
+        uint64_t              model_size,
+        float                 eps);
+
 /* Metal: while on, ds4_gpu_hc_weighted_sum[_split]_tensor, ds4_gpu_hc_expand_split_tensor
  * (HC=4), ds4_gpu_swiglu_tensor and ds4_gpu_add_tensor store BF16-rounded values
  * (bitwise equal to the op followed by V4.1 BF16 rounding). */

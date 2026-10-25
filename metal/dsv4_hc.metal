@@ -694,6 +694,10 @@ kernel void kernel_dsv4_hc_expand4_t(
     float block_v = *((device const float *) (block_out + d*args.nb_block0 + t*args.nb_block1));
     if (args.has_add) {
         block_v += *((device const float *) (block_add + d*args.nb_add0 + t*args.nb_add1));
+        if (B) {
+            // V4.1: the summed block is a BF16 activation (kernel_add2_bf16_f32)
+            block_v = ds4_hc4_bf16_round(block_v);
+        }
     }
 
     const float r0 = *((device const float *) (residual + d*args.nb_res0 + 0*args.nb_res1 + t*args.nb_res2));

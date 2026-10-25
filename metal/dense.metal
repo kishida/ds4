@@ -219,6 +219,33 @@ kernel void kernel_mul_mv_q8_0_bf16_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// Two BF16-storing Q8_0 matvecs of the same input in one dispatch: threadgroups below ntg_a
+// compute A's rows, the rest B's. Every row takes kernel_mul_mv_q8_0_bf16_f32's walk and tree,
+// so both outputs are bitwise those of two dispatches.
+[[host_name("kernel_dsv41_mul_mv_q8_0_bf16_pair_f32")]]
+kernel void kernel_dsv41_mul_mv_q8_0_bf16_pair_f32(
+        constant ds4_metal_args_mul_mv & args_a,
+        constant ds4_metal_args_mul_mv & args_b,
+        constant uint & ntg_a,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_a,
+        device       char * dst_b,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (tgpig.x < ntg_a) {
+        kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true>(
+            args_a, src0_a, src1, dst_a, shmem, tgpig, tiisg, sgitg);
+    } else {
+        tgpig.x -= ntg_a;
+        kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true>(
+            args_b, src0_b, src1, dst_b, shmem, tgpig, tiisg, sgitg);
+    }
+}
+
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
 // K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl, plus the checked
 // poll-gate flag published by the last-arriving threadgroup (see

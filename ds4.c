@@ -41630,6 +41630,20 @@ static bool ds41_attention_select(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_layer_weights *l) {
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
+#if defined(__APPLE__)
+    /* q_a and kv share their input and so do their norms: one dispatch each */
+    if (ds41_fuse_enabled() &&
+        l->attn_q_a->type == DS4_TENSOR_Q8_0 && l->attn_kv->type == DS4_TENSOR_Q8_0 &&
+        l->attn_q_a_norm->type == DS4_TENSOR_F32 && l->attn_kv_a_norm->type == DS4_TENSOR_F32)
+        return ds4_gpu_dsv41_matmul_q8_0_bf16_pair_tensor(g->qr, g->kv, m->map, m->size,
+                l->attn_q_a->abs_offset, l->attn_kv->abs_offset, l->attn_q_a->dim[0],
+                l->attn_q_a->dim[1], l->attn_kv->dim[1], g->norm) &&
+            ds4_gpu_dsv41_rms_norm_bf16_pair_tensor(
+                g->qr, g->qr, l->attn_q_a_norm->abs_offset, (uint32_t)l->attn_q_a_norm->dim[0],
+                g->kv, g->kv, l->attn_kv_a_norm->abs_offset, (uint32_t)l->attn_kv_a_norm->dim[0],
+                m->map, m->size, DS4_RMS_EPS) &&
+            ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr, g->tp_rank * q_dim, q_dim);
+#endif
     return ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true) &&
         ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
         ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr,
@@ -42184,6 +42198,19 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
 
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
+#if defined(__APPLE__)
+    /* one machine: the BF16 routed + shared sum is formed inside the HC expand
+     * (bitwise the add followed by the expand) */
+    if (ds41_fuse_enabled() && g->tp_world == 1) {
+        if (!ds41_graph_before_moe(g, m, l, il) ||
+            !ds41_moe_partial(g, m, l, il, (uint32_t)token)) return false;
+        ds4_gpu_set_store_bf16(true);
+        const bool ok = ds4_gpu_hc_expand_add_split_tensor(g->residual, g->routed, g->shared,
+            g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC) != 0;
+        ds4_gpu_set_store_bf16(false);
+        return ok && ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
+    }
+#endif
     return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
         ds41_graph_after_moe(g);
 }
