@@ -240,6 +240,112 @@ kernel void kernel_dsv4_flash_kv_stage_f16(
     }
 }
 
+// V4.1: the compressed rows are F32 rows of the compressed cache picked by comp_ids, converted
+// here (the conversion of kernel_get_rows_f32_f16, which this replaces) instead of read from a
+// gathered F16 copy. Staged bytes are those of the gather followed by
+// kernel_dsv4_flash_kv_stage_f16.
+kernel void kernel_dsv41_flash_kv_stage_gather_f16(
+        constant ds4_metal_args_flash_kv_stage_f16 & args,
+        device const char * raw_src,
+        device const char * comp_src,
+        device       char * dst,
+        device const char * mask_src,
+        device       char * pad_dst,
+        device const int32_t * comp_ids,
+        uint gid [[thread_position_in_grid]]) {
+    constexpr uint row_vecs = 128;
+    const uint raw_vecs = args.n_raw * row_vecs;
+    const uint n_keys = args.n_raw + args.n_comp;
+    const uint total_vecs = n_keys * row_vecs;
+
+    if (gid < raw_vecs) {
+        const uint logical_row = gid >> 7;
+        const uint col = gid & 127u;
+        uint physical_row = args.raw_start + logical_row;
+        if (physical_row >= args.raw_cap) {
+            physical_row -= args.raw_cap;
+        }
+        device const packed_float4 *raw =
+            (device const packed_float4 *)raw_src;
+        device packed_half4 *dst_half = (device packed_half4 *)dst;
+        const float4 value =
+            float4(raw[physical_row * row_vecs + col]);
+        dst_half[gid] = packed_half4(half4(value));
+        return;
+    }
+
+    if (gid < total_vecs) {
+        const uint comp_vec = gid - raw_vecs;
+        device const packed_float4 *comp =
+            (device const packed_float4 *)comp_src;
+        device packed_half4 *dst_half = (device packed_half4 *)dst;
+        const float4 value =
+            float4(comp[(uint)comp_ids[comp_vec >> 7] * row_vecs + (comp_vec & 127u)]);
+        dst_half[gid] = packed_half4(half4(value));
+        return;
+    }
+
+    // The vector FlashAttention kernel redirects its final partial block to
+    // a compact K/V/mask buffer. When requested, append those writes to this
+    // dispatch so gathered decode does not need a standalone pad dispatch.
+    const uint pad_rows = args.pad_rows;
+    const uint pad_vecs = pad_rows * row_vecs;
+    uint pad_gid = gid - total_vecs;
+    if (pad_gid < pad_vecs) {
+        const uint row = pad_gid >> 7;
+        const uint col = pad_gid & 127u;
+        const uint valid_rows = n_keys % pad_rows;
+        device packed_half4 *pad_half = (device packed_half4 *)pad_dst;
+            if (row >= valid_rows) {
+            const packed_half4 zero = packed_half4(half4(0.0h));
+            pad_half[pad_gid] = zero;
+            if (!args.shared_pad) {
+                pad_half[pad_vecs + pad_gid] = zero;
+            }
+            return;
+        }
+
+        const uint logical_row = n_keys - valid_rows + row;
+        if (logical_row < args.n_raw) {
+            uint physical_row = args.raw_start + logical_row;
+            if (physical_row >= args.raw_cap) {
+                physical_row -= args.raw_cap;
+            }
+            device const packed_float4 *raw =
+                (device const packed_float4 *)raw_src;
+            const float4 value =
+                float4(raw[physical_row * row_vecs + col]);
+            const packed_half4 value_half = packed_half4(half4(value));
+            pad_half[pad_gid] = value_half;
+            if (!args.shared_pad) {
+                pad_half[pad_vecs + pad_gid] = value_half;
+            }
+        } else {
+            device const packed_float4 *comp =
+                (device const packed_float4 *)comp_src;
+            const float4 value =
+                float4(comp[(uint)comp_ids[logical_row - args.n_raw] * row_vecs + col]);
+            const packed_half4 value_half = packed_half4(half4(value));
+            pad_half[pad_gid] = value_half;
+            if (!args.shared_pad) {
+                pad_half[pad_vecs + pad_gid] = value_half;
+            }
+        }
+        return;
+    }
+
+    pad_gid -= pad_vecs;
+    if (pad_gid < pad_rows) {
+        const uint valid_rows = n_keys % pad_rows;
+        device const ushort *mask_bits = (device const ushort *)mask_src;
+        device ushort *pad_mask_bits =
+            (device ushort *)pad_dst + 2u * pad_vecs * 4u;
+        pad_mask_bits[pad_gid] = pad_gid < valid_rows
+            ? mask_bits[n_keys - valid_rows + pad_gid]
+            : 0xfbffu;
+    }
+}
+
 
 // Tiled-row expansion of a small table: dst row t = src row (pos0 + t) % ratio.
 // Replaces the per-segment copies the compressor store used to encode (one

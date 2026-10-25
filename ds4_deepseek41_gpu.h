@@ -142,11 +142,10 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
                                  uint32_t outputs, uint32_t rows,
                                  const ds4_gpu_tensor *in);
 /* Gather 512-wide F32 KV rows; IDs must come from top-k over source_rows. */
+/* Metal: while set (non-NULL), the next gathered attention's compressed operand is the F32
+ * compressed cache, its rows picked by ids and converted to F16 during KV staging. */
+void ds4_gpu_dsv41_set_stage_comp_ids(const ds4_gpu_tensor *ids);
 int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
-                           const ds4_gpu_tensor *ids, uint32_t source_rows,
-                           uint32_t selected_rows);
-/* Same gather storing F16 rows (the F32 -> F16 conversion of the attention staging copy). */
-int ds4_gpu_dsv41_gather_kv_f16(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
                            const ds4_gpu_tensor *ids, uint32_t source_rows,
                            uint32_t selected_rows);
 

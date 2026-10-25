@@ -27630,6 +27630,16 @@ static int ds4_gpu_encode_copy_raw_ring_to_f16(
     return 1;
 }
 
+/* V4.1: while set, the gathered attention's "compressed" rows are the F32 compressed-cache
+ * rows these indices select, gathered and converted to F16 by the staging dispatch itself. */
+static id<MTLBuffer> g_v41_stage_ids;
+static NSUInteger g_v41_stage_ids_offset;
+
+void ds4_gpu_dsv41_set_stage_comp_ids(const ds4_gpu_tensor *ids) {
+    g_v41_stage_ids = ids ? ds4_gpu_tensor_buffer(ids) : nil;
+    g_v41_stage_ids_offset = ids ? (NSUInteger)ds4_gpu_tensor_offset(ids) : 0;
+}
+
 static int ds4_gpu_encode_flash_kv_stage_f16(
         id<MTLCommandBuffer> cb,
         id<MTLBuffer>        raw,
@@ -27692,6 +27702,13 @@ static int ds4_gpu_encode_flash_kv_stage_f16(
                 "ds4: required Metal gathered KV staging kernel was not selected\n");
         return 0;
     }
+    static id<MTLComputePipelineState> gather_pipeline;
+    if (g_v41_stage_ids && !gather_pipeline)
+        gather_pipeline = ds4_gpu_get_pipeline("kernel_dsv41_flash_kv_stage_gather_f16");
+    if (g_v41_stage_ids && (!use_fusion || !gather_pipeline)) {
+        fprintf(stderr, "ds4: V4.1 gathering KV staging needs the fused staging path\n");
+        return 0;
+    }
 
     if (use_fusion) {
         ds4_gpu_flash_kv_stage_f16_args args = {
@@ -27719,8 +27736,9 @@ static int ds4_gpu_encode_flash_kv_stage_f16(
             if (!ds4_gpu_kv_norm_task_flush()) return 0;
             enc = ds4_gpu_compute_encoder(cb);
         }
-        [enc setComputePipelineState:g_flash_kv_stage_f16_pipeline];
+        [enc setComputePipelineState:g_v41_stage_ids ? gather_pipeline : g_flash_kv_stage_f16_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
+        if (g_v41_stage_ids) [enc setBuffer:g_v41_stage_ids offset:g_v41_stage_ids_offset atIndex:6];
         [enc setBuffer:raw offset:raw_offset atIndex:1];
         [enc setBuffer:comp offset:comp_offset atIndex:2];
         [enc setBuffer:dst offset:dst_offset atIndex:3];
@@ -48464,9 +48482,9 @@ int ds4_gpu_dsv41_candidate_filter(ds4_gpu_tensor *scores,
     return dsv41_candidates(scores, scores, block_mask, width, rows, start, ratio);
 }
 
-static int ds4_gpu_dsv41_gather_kv_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
-                                        const ds4_gpu_tensor *ids, uint32_t source_rows,
-                                        uint32_t selected_rows, bool out_f16) {
+int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
+                           const ds4_gpu_tensor *ids, uint32_t source_rows,
+                           uint32_t selected_rows) {
     if (!source_rows || !selected_rows || selected_rows > 512 ||
         selected_rows > source_rows ||
         !dsv41_tensor_has_floats(source, (uint64_t)source_rows * 512u) ||
@@ -48475,7 +48493,6 @@ static int ds4_gpu_dsv41_gather_kv_impl(ds4_gpu_tensor *out, const ds4_gpu_tenso
     if (!g_initialized && !ds4_gpu_init()) return 0;
     @autoreleasepool {
         const uint64_t row_bytes = 512u * sizeof(float);
-        const uint64_t out_row_bytes = 512u * (out_f16 ? sizeof(uint16_t) : sizeof(float));
         const ds4_gpu_get_rows_args args = {
             .ne00t = 512, .ne00 = 512, .nb01 = row_bytes,
             .nb02 = (uint64_t)source_rows * row_bytes,
@@ -48483,18 +48500,14 @@ static int ds4_gpu_dsv41_gather_kv_impl(ds4_gpu_tensor *out, const ds4_gpu_tenso
             .ne10 = (int32_t)selected_rows, .nb10 = sizeof(int32_t),
             .nb11 = (uint64_t)selected_rows * sizeof(int32_t),
             .nb12 = (uint64_t)selected_rows * sizeof(int32_t),
-            .nb1 = out_row_bytes, .nb2 = (uint64_t)selected_rows * out_row_bytes,
-            .nb3 = (uint64_t)selected_rows * out_row_bytes,
+            .nb1 = row_bytes, .nb2 = (uint64_t)selected_rows * row_bytes,
+            .nb3 = (uint64_t)selected_rows * row_bytes,
         };
-        static id<MTLComputePipelineState> f16_pipeline;
-        if (out_f16 && !f16_pipeline) f16_pipeline = ds4_gpu_get_pipeline("kernel_get_rows_f32_f16");
-        id<MTLComputePipelineState> pipeline = out_f16 ? f16_pipeline : g_get_rows_f32_pipeline;
-        if (!pipeline) return 0;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
         if (!enc) return 0;
-        [enc setComputePipelineState:pipeline];
+        [enc setComputePipelineState:g_get_rows_f32_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         const ds4_gpu_tensor *inputs[] = {source, ids, out};
         for (NSUInteger i = 0; i < 3; i++)
@@ -48505,18 +48518,6 @@ static int ds4_gpu_dsv41_gather_kv_impl(ds4_gpu_tensor *out, const ds4_gpu_tenso
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 sparse KV gather");
     }
-}
-
-int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
-                           const ds4_gpu_tensor *ids, uint32_t source_rows,
-                           uint32_t selected_rows) {
-    return ds4_gpu_dsv41_gather_kv_impl(out, source, ids, source_rows, selected_rows, false);
-}
-
-int ds4_gpu_dsv41_gather_kv_f16(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
-                               const ds4_gpu_tensor *ids, uint32_t source_rows,
-                               uint32_t selected_rows) {
-    return ds4_gpu_dsv41_gather_kv_impl(out, source, ids, source_rows, selected_rows, true);
 }
 
 void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {
