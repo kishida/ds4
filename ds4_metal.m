@@ -19292,6 +19292,7 @@ int ds4_gpu_dsv4_topk_mask_tensor(
 /* Set only around ds4_gpu_matmul_q8_0_bf16_tensor's single-token matvec. */
 static bool g_q8_mv_round_bf16;
 
+
 static int ds4_gpu_matmul_q8_0_legacy_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -40954,6 +40955,8 @@ int ds4_gpu_routed_moe_one_tensor(
         const bool down_rows_per_group_is_nr0 = ds4_gpu_routed_mv_rows_per_group_is_nr0(down_type);
         int pair_swiglu_nsg = 2;
         int down_sum6_nsg = 2;
+        uint32_t down_sum6_nr0 = 0; /* 0: the down matvec rows per simdgroup */
+        uint32_t pair_swiglu_nr0 = 0; /* 0: the gate matvec rows per simdgroup */
         int ok = 1;
         const bool write_clamped_moe =
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL;
@@ -41047,6 +41050,16 @@ int ds4_gpu_routed_moe_one_tensor(
             pair_swiglu_pipeline = g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline;
         } else if (gate_type == DS4_METAL_TENSOR_Q4_K) {
             pair_swiglu_pipeline = g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline;
+            /* Single token: one row per simdgroup doubles the threadgroups
+             * over the same rows; every row's sums are unchanged. */
+            if (n_tokens == 1) {
+                id<MTLComputePipelineState> nr1 = ds4_gpu_get_mul_mv_pipeline(
+                    "kernel_mul_mv_id_q4_K_pair_swiglu_nr1_f32", (int16_t)pair_swiglu_nsg);
+                if (nr1) {
+                    pair_swiglu_pipeline = nr1;
+                    pair_swiglu_nr0 = 1;
+                }
+            }
         } else if (gate_type == DS4_METAL_TENSOR_MXFP4) {
             pair_swiglu_pipeline = g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline;
             if (use_m5_tp_mxfp4_static) {
@@ -41087,6 +41100,15 @@ int ds4_gpu_routed_moe_one_tensor(
             down_sum6_pipeline = g_moe_mul_mv_id_q2_k_sum6_pipeline;
         } else if (down_type == DS4_METAL_TENSOR_Q4_K) {
             down_sum6_pipeline = g_moe_mul_mv_id_q4_k_sum6_pipeline;
+            /* Single token: one row per simdgroup, as for the pair above. */
+            if (n_tokens == 1) {
+                id<MTLComputePipelineState> nr1 = ds4_gpu_get_mul_mv_pipeline(
+                    "kernel_mul_mv_id_q4_K_sum6_nr1_f32", (int16_t)down_sum6_nsg);
+                if (nr1) {
+                    down_sum6_pipeline = nr1;
+                    down_sum6_nr0 = 1;
+                }
+            }
         } else if (down_type == DS4_METAL_TENSOR_MXFP4) {
             down_sum6_pipeline = g_moe_mul_mv_id_mxfp4_sum6_pipeline;
             if (use_m5_tp_mxfp4_static) {
@@ -43019,9 +43041,11 @@ int ds4_gpu_routed_moe_one_tensor(
                 .write_clamped = 0,
                 .clamp_value = clamp,
             };
+            ds4_gpu_mul_mv_id_args pair_args = gate_args;
+            if (pair_swiglu_nr0) pair_args.nr0 = (int32_t)pair_swiglu_nr0;
             ok = ds4_gpu_encode_mul_mv_id_pair_swiglu(cb,
                                                         pair_swiglu_pipeline,
-                                                        &gate_args,
+                                                        &pair_args,
                                                         &act_args,
                                                         gate_buf,
                                                         (NSUInteger)gate_inner,
@@ -43339,9 +43363,11 @@ int ds4_gpu_routed_moe_one_tensor(
                                                        2);
             }
         } else if (ok && direct_down_sum) {
+            ds4_gpu_mul_mv_id_args sum6_args = down_args;
+            if (down_sum6_nr0) sum6_args.nr0 = (int32_t)down_sum6_nr0;
             ok = ds4_gpu_encode_mul_mv_id_sum6(cb,
                                                  down_sum6_pipeline,
-                                                 &down_args,
+                                                 &sum6_args,
                                                  down_buf,
                                                  (NSUInteger)down_inner,
                                                  midbuf,
