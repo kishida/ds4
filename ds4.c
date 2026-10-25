@@ -41667,8 +41667,6 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                              g->kv, 0, 512u * 4u) ||
         !ds41_attention_select(g, m, l, il)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
-    /* Metal: gather the selected rows straight into F16, the attention's
-     * staging format, so raw and compressed rows stage in one dispatch. */
 #if defined(__APPLE__)
     /* the KV staging dispatch gathers the selected F32 rows itself, as F16 */
     const uint32_t comp_f16 = ds41_fuse_enabled();
