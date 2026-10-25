@@ -749,6 +749,27 @@ int ds4_gpu_dsv41_router_select_one(
         float                 expert_weight_scale,
         const ds4_gpu_tensor *logits);
 
+/* V4.1 single-token HC-pre tail in one dispatch: split/Sinkhorn of mix into split, BF16 collapse
+ * of residual_hc with pre into x_out, BF16 weighted RMSNorm of x_out into norm_out; bitwise equal
+ * to ds4_gpu_hc_split_sinkhorn_tensor + BF16 weighted sum + ds4_gpu_rms_norm_weight_rows_bf16_tensor. */
+int ds4_gpu_dsv41_hc_split_sum_norm_tensor(
+        ds4_gpu_tensor       *split,
+        ds4_gpu_tensor       *x_out,
+        ds4_gpu_tensor       *norm_out,
+        const ds4_gpu_tensor *mix,
+        const ds4_gpu_tensor *pre,
+        const ds4_gpu_tensor *residual_hc,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              scale_offset,
+        uint64_t              base_offset,
+        uint64_t              norm_offset,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              sinkhorn_iters,
+        float                 hc_eps,
+        float                 norm_eps);
+
 /* Metal: while on, ds4_gpu_hc_weighted_sum[_split]_tensor, ds4_gpu_hc_expand_split_tensor
  * (HC=4), ds4_gpu_swiglu_tensor and ds4_gpu_add_tensor store BF16-rounded values
  * (bitwise equal to the op followed by V4.1 BF16 rounding). */

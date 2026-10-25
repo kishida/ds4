@@ -110,6 +110,77 @@ static inline float4 ds4_hc_twice_sigmoid(float4 z) { return 2.0f / (1.0f + exp(
 // Splits an HC mixer row into pre weights, post gates, and the HC-to-HC
 // combination matrix. The 4-channel path is specialized because DS4 Flash uses
 // HC=4 in normal inference, while the scalar fallback keeps diagnostics usable.
+// HC=4 split + Sinkhorn of one mixer row; shared by the standalone split kernel and the V4.1
+// fused HC-pre tail so both compile the same arithmetic.
+static inline void ds4_hc_split_sinkhorn4(
+        device const float * mix,
+        device const float * base,
+        float pre_scale, float post_scale, float comb_scale, float epsv,
+        int sinkhorn_iters,
+        device float * out) {
+    const float4 pre_z =
+        *((device const float4 *) mix) * pre_scale +
+        *((device const float4 *) base);
+    *((device float4 *) out) = ds4_hc_sigmoid(pre_z) + epsv;
+
+    const float4 post_z =
+        *((device const float4 *) (mix  + 4)) * post_scale +
+        *((device const float4 *) (base + 4));
+    *((device float4 *) (out + 4)) = ds4_hc_twice_sigmoid(post_z);
+
+    float4 r0 =
+        *((device const float4 *) (mix  +  8)) * comb_scale +
+        *((device const float4 *) (base +  8));
+    float4 r1 =
+        *((device const float4 *) (mix  + 12)) * comb_scale +
+        *((device const float4 *) (base + 12));
+    float4 r2 =
+        *((device const float4 *) (mix  + 16)) * comb_scale +
+        *((device const float4 *) (base + 16));
+    float4 r3 =
+        *((device const float4 *) (mix  + 20)) * comb_scale +
+        *((device const float4 *) (base + 20));
+
+    const float m0 = max(max(r0.x, r0.y), max(r0.z, r0.w));
+    const float m1 = max(max(r1.x, r1.y), max(r1.z, r1.w));
+    const float m2 = max(max(r2.x, r2.y), max(r2.z, r2.w));
+    const float m3 = max(max(r3.x, r3.y), max(r3.z, r3.w));
+
+    r0 = exp(r0 - m0);
+    r1 = exp(r1 - m1);
+    r2 = exp(r2 - m2);
+    r3 = exp(r3 - m3);
+
+    r0 = r0 * (1.0f / (r0.x + r0.y + r0.z + r0.w)) + epsv;
+    r1 = r1 * (1.0f / (r1.x + r1.y + r1.z + r1.w)) + epsv;
+    r2 = r2 * (1.0f / (r2.x + r2.y + r2.z + r2.w)) + epsv;
+    r3 = r3 * (1.0f / (r3.x + r3.y + r3.z + r3.w)) + epsv;
+
+    float4 col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
+    r0 *= col_inv;
+    r1 *= col_inv;
+    r2 *= col_inv;
+    r3 *= col_inv;
+
+    for (int iter = 1; iter < sinkhorn_iters; ++iter) {
+        r0 *= 1.0f / (r0.x + r0.y + r0.z + r0.w + epsv);
+        r1 *= 1.0f / (r1.x + r1.y + r1.z + r1.w + epsv);
+        r2 *= 1.0f / (r2.x + r2.y + r2.z + r2.w + epsv);
+        r3 *= 1.0f / (r3.x + r3.y + r3.z + r3.w + epsv);
+
+        col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
+        r0 *= col_inv;
+        r1 *= col_inv;
+        r2 *= col_inv;
+        r3 *= col_inv;
+    }
+
+    *((device float4 *) (out +  8)) = r0;
+    *((device float4 *) (out + 12)) = r1;
+    *((device float4 *) (out + 16)) = r2;
+    *((device float4 *) (out + 20)) = r3;
+}
+
 kernel void kernel_dsv4_hc_split_sinkhorn(
         constant ds4_metal_args_dsv4_hc_split_sinkhorn & args,
         device  const float * mixes,
@@ -136,67 +207,8 @@ kernel void kernel_dsv4_hc_split_sinkhorn(
     const float comb_scale = scale[2];
 
     if (HC == 4) {
-        const float4 pre_z =
-            *((device const float4 *) mix) * pre_scale +
-            *((device const float4 *) base);
-        *((device float4 *) out) = ds4_hc_sigmoid(pre_z) + epsv;
-
-        const float4 post_z =
-            *((device const float4 *) (mix  + 4)) * post_scale +
-            *((device const float4 *) (base + 4));
-        *((device float4 *) (out + 4)) = ds4_hc_twice_sigmoid(post_z);
-
-        float4 r0 =
-            *((device const float4 *) (mix  +  8)) * comb_scale +
-            *((device const float4 *) (base +  8));
-        float4 r1 =
-            *((device const float4 *) (mix  + 12)) * comb_scale +
-            *((device const float4 *) (base + 12));
-        float4 r2 =
-            *((device const float4 *) (mix  + 16)) * comb_scale +
-            *((device const float4 *) (base + 16));
-        float4 r3 =
-            *((device const float4 *) (mix  + 20)) * comb_scale +
-            *((device const float4 *) (base + 20));
-
-        const float m0 = max(max(r0.x, r0.y), max(r0.z, r0.w));
-        const float m1 = max(max(r1.x, r1.y), max(r1.z, r1.w));
-        const float m2 = max(max(r2.x, r2.y), max(r2.z, r2.w));
-        const float m3 = max(max(r3.x, r3.y), max(r3.z, r3.w));
-
-        r0 = exp(r0 - m0);
-        r1 = exp(r1 - m1);
-        r2 = exp(r2 - m2);
-        r3 = exp(r3 - m3);
-
-        r0 = r0 * (1.0f / (r0.x + r0.y + r0.z + r0.w)) + epsv;
-        r1 = r1 * (1.0f / (r1.x + r1.y + r1.z + r1.w)) + epsv;
-        r2 = r2 * (1.0f / (r2.x + r2.y + r2.z + r2.w)) + epsv;
-        r3 = r3 * (1.0f / (r3.x + r3.y + r3.z + r3.w)) + epsv;
-
-        float4 col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
-        r0 *= col_inv;
-        r1 *= col_inv;
-        r2 *= col_inv;
-        r3 *= col_inv;
-
-        for (int iter = 1; iter < args.sinkhorn_iters; ++iter) {
-            r0 *= 1.0f / (r0.x + r0.y + r0.z + r0.w + epsv);
-            r1 *= 1.0f / (r1.x + r1.y + r1.z + r1.w + epsv);
-            r2 *= 1.0f / (r2.x + r2.y + r2.z + r2.w + epsv);
-            r3 *= 1.0f / (r3.x + r3.y + r3.z + r3.w + epsv);
-
-            col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
-            r0 *= col_inv;
-            r1 *= col_inv;
-            r2 *= col_inv;
-            r3 *= col_inv;
-        }
-
-        *((device float4 *) (out +  8)) = r0;
-        *((device float4 *) (out + 12)) = r1;
-        *((device float4 *) (out + 16)) = r2;
-        *((device float4 *) (out + 20)) = r3;
+        ds4_hc_split_sinkhorn4(mix, base, pre_scale, post_scale, comb_scale, epsv,
+                               args.sinkhorn_iters, out);
         return;
     }
 
@@ -1095,6 +1107,88 @@ kernel void kernel_dsv4_hc_weighted_sum_t(
 typedef decltype(kernel_dsv4_hc_weighted_sum_t<false>) kernel_dsv4_hc_weighted_sum_fn;
 template [[host_name("kernel_dsv4_hc_weighted_sum")]] kernel kernel_dsv4_hc_weighted_sum_fn kernel_dsv4_hc_weighted_sum_t<false>;
 template [[host_name("kernel_dsv4_hc_weighted_sum_bf16")]] kernel kernel_dsv4_hc_weighted_sum_fn kernel_dsv4_hc_weighted_sum_t<true>;
+
+// V4.1 decode HC-pre tail for one token, HC=4: split/Sinkhorn of this sublayer's mixer row,
+// the BF16 collapse of the four residual streams with the previous split's pre weights, and the
+// BF16 weighted RMSNorm of the collapsed row. Lane 0 runs kernel_dsv4_hc_split_sinkhorn's
+// arithmetic (the collapse does not read it); the collapse repeats
+// kernel_dsv4_hc_weighted_sum_bf16's per-element order; the norm repeats
+// kernel_rms_norm_mul_bf16_f32_4's reduction tree, so the host must launch the same thread count
+// as that kernel (ds4_gpu_rms_norm_threads). Outputs are bitwise those of the three kernels.
+struct ds4_metal_args_dsv41_hc_split_sum_norm {
+    uint  n_embd;          // % 4 == 0
+    int   sinkhorn_iters;
+    float hc_eps;
+    float norm_eps;
+};
+
+kernel void kernel_dsv41_hc_split_sum_norm(
+        constant ds4_metal_args_dsv41_hc_split_sum_norm & args,
+        device const float * mix,
+        device const float * scale,
+        device const float * base,
+        device const float * pre,
+        device const float * x,
+        device       float * split,
+        device       float * dst,
+        device const float * norm_weight,
+        device       float * norm_dst,
+        threadgroup  float * shmem [[threadgroup(0)]],
+        ushort tid   [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort ntg   [[threads_per_threadgroup]]) {
+    if (tid == 0) {
+        ds4_hc_split_sinkhorn4(mix, base, scale[0], scale[1], scale[2], args.hc_eps,
+                               args.sinkhorn_iters, split);
+    }
+
+    const uint n4 = args.n_embd >> 2;
+    device const float4 * x0 = (device const float4 *) x;
+    device const float4 * x1 = x0 + n4;
+    device const float4 * x2 = x1 + n4;
+    device const float4 * x3 = x2 + n4;
+    device float4 * dst4 = (device float4 *) dst;
+    const float p0 = pre[0], p1 = pre[1], p2 = pre[2], p3 = pre[3];
+
+    if (sgitg == 0) {
+        shmem[tiisg] = 0.0f;
+    }
+
+    float sumf = 0.0f;
+    for (uint i = tid; i < n4; i += ntg) {
+        float4 v = 0.0f;
+        v += x0[i] * p0;
+        v += x1[i] * p1;
+        v += x2[i] * p2;
+        v += x3[i] * p3;
+        v = float4(ds4_hc_bf16_round(v.x), ds4_hc_bf16_round(v.y),
+                   ds4_hc_bf16_round(v.z), ds4_hc_bf16_round(v.w));
+        dst4[i] = v;
+        sumf += dot(v, v);
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shmem[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+    sumf = shmem[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float mean  = sumf/(float)args.n_embd;
+    const float rscale = 1.0f/sqrt(mean + args.norm_eps);
+
+    device const float4 * w4 = (device const float4 *) norm_weight;
+    device float4 * y4 = (device float4 *) norm_dst;
+    for (uint i = tid; i < n4; i += ntg) {
+        const float4 y = (dst4[i]*rscale)*w4[i];
+        y4[i] = float4(ds4_hc_bf16_round(y.x), ds4_hc_bf16_round(y.y),
+                       ds4_hc_bf16_round(y.z), ds4_hc_bf16_round(y.w));
+    }
+}
 
 // The one-row HC=4 output head historically materializes four device-F32
 // stages across separate launches. Collapse those launches into one tiny

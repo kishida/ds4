@@ -41455,18 +41455,52 @@ static bool ds41_rope(ds4_gpu_tensor *x, uint32_t heads, uint32_t width,
                               ds4_layer_compress_ratio(il) != 0, inverse);
 }
 
-static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
-                        const ds4_layer_weights *l, bool ffn) {
+/* The HC mixer row of the sublayer's residual: flat RMSNorm, then the F16 matvec. */
+static bool ds41_hc_mix_row(ds41_gpu_graph *g, const ds4_model *m,
+                            const ds4_layer_weights *l, bool ffn) {
     const ds4_gpu_tensor *residual = ffn ? g->after_attn : g->residual;
     const ds4_tensor *fn = ffn ? l->hc_ffn_fn : l->hc_attn_fn;
-    const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
-    const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
+#if defined(__APPLE__)
+    /* One dispatch for both; the kernel replays both reduction trees, so the
+     * row is bitwise unchanged. */
+    if (fn->type == DS4_TENSOR_F16 && ds4_gpu_hc_rms_norm_mix_f16_available())
+        return ds4_gpu_hc_rms_norm_mix_f16_tensor(g->mix, residual, m->map, m->size,
+            fn->abs_offset, DS4_N_HC * DS4_N_EMBD, (uint32_t)fn->dim[1], DS4_RMS_EPS) != 0;
+#endif
     return ds4_gpu_rms_norm_plain_tensor(g->flat_norm, residual,
                DS4_N_HC * DS4_N_EMBD, DS4_RMS_EPS) &&
-           ds41_matmul(g->mix, m, fn, g->flat_norm, false) &&
+           ds41_matmul(g->mix, m, fn, g->flat_norm, false);
+}
+
+static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
+                        const ds4_layer_weights *l, bool ffn) {
+    const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
+    const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
+    return ds41_hc_mix_row(g, m, l, ffn) &&
            ds4_gpu_hc_split_sinkhorn_tensor(ffn ? g->ffn_split : g->attn_split,
                g->mix, m->map, m->size, scale->abs_offset, base->abs_offset,
                DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
+}
+
+/* Sublayer HC-pre: mixer row and split, the collapse of the residual streams
+ * with the previous split's pre weights, and the sublayer RMSNorm. */
+static bool ds41_hc_pre(ds41_gpu_graph *g, const ds4_model *m,
+                        const ds4_layer_weights *l, bool ffn) {
+    const ds4_gpu_tensor *residual = ffn ? g->after_attn : g->residual;
+    const ds4_gpu_tensor *pre = ffn ? g->attn_split : g->pre;
+    const ds4_tensor *norm = ffn ? l->ffn_norm : l->attn_norm;
+#if defined(__APPLE__)
+    const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
+    const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
+    if (ds41_fuse_enabled() && DS4_N_HC == 4 && norm->type == DS4_TENSOR_F32)
+        return ds41_hc_mix_row(g, m, l, ffn) &&
+            ds4_gpu_dsv41_hc_split_sum_norm_tensor(ffn ? g->ffn_split : g->attn_split,
+                g->x, g->norm, g->mix, pre, residual, m->map, m->size,
+                scale->abs_offset, base->abs_offset, norm->abs_offset,
+                DS4_N_EMBD, DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS) != 0;
+#endif
+    return ds41_hc_mix(g, m, l, ffn) && ds41_hc_sum(g->x, residual, pre, ffn) &&
+        ds41_norm(g->norm, g->x, m, norm);
 }
 
 static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
@@ -41848,15 +41882,13 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
             return false;
     }
     return ds41_dspark_capture(g->dspark, il, g->pos, g->residual, 1) &&
-        ds41_hc_mix(g, m, l, false) &&
-        ds41_hc_sum(g->x, g->residual, g->pre, false) && ds41_norm(g->norm, g->x, m, l->attn_norm);
+        ds41_hc_pre(g, m, l, false);
 }
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l) {
     return ds41_hc_expand(g->after_attn, g->block, g->residual, g->attn_split) &&
-        ds41_hc_mix(g, m, l, true) &&
-        ds41_hc_sum(g->x, g->after_attn, g->attn_split, true) && ds41_norm(g->norm, g->x, m, l->ffn_norm);
+        ds41_hc_pre(g, m, l, true);
 }
 
 static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,

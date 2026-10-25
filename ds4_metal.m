@@ -40250,6 +40250,86 @@ int ds4_gpu_dsv41_router_select_one(
     return 1;
 }
 
+/* V4.1 decode HC-pre tail in one dispatch: split/Sinkhorn of mix into split, the BF16 collapse
+ * of residual_hc with pre (the previous split's first n_hc values) into x_out, and the BF16
+ * weighted RMSNorm of x_out into norm_out. Bitwise equal to hc_split_sinkhorn +
+ * hc_weighted_sum(_split) BF16 + rms_norm_weight_rows_bf16. */
+int ds4_gpu_dsv41_hc_split_sum_norm_tensor(
+        ds4_gpu_tensor       *split,
+        ds4_gpu_tensor       *x_out,
+        ds4_gpu_tensor       *norm_out,
+        const ds4_gpu_tensor *mix,
+        const ds4_gpu_tensor *pre,
+        const ds4_gpu_tensor *residual_hc,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              scale_offset,
+        uint64_t              base_offset,
+        uint64_t              norm_offset,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              sinkhorn_iters,
+        float                 hc_eps,
+        float                 norm_eps) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!split || !x_out || !norm_out || !mix || !pre || !residual_hc || !model_map ||
+        n_hc != 4 || n_embd == 0 || (n_embd & 3u) != 0) return 0;
+    static id<MTLComputePipelineState> pipeline;
+    if (!pipeline) pipeline = ds4_gpu_get_pipeline("kernel_dsv41_hc_split_sum_norm");
+    const NSUInteger nth = ds4_gpu_rms_norm_threads(n_embd);
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < nth) return 0;
+    const uint64_t mix_bytes = (2ull * n_hc + (uint64_t)n_hc * n_hc) * sizeof(float);
+    const uint64_t row_bytes = (uint64_t)n_embd * sizeof(float);
+    @autoreleasepool {
+        id<MTLBuffer> splitbuf = ds4_gpu_tensor_buffer(split);
+        id<MTLBuffer> xoutbuf = ds4_gpu_tensor_buffer(x_out);
+        id<MTLBuffer> normbuf = ds4_gpu_tensor_buffer(norm_out);
+        id<MTLBuffer> mixbuf = ds4_gpu_tensor_buffer(mix);
+        id<MTLBuffer> prebuf = ds4_gpu_tensor_buffer(pre);
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(residual_hc);
+        if (!splitbuf || !xoutbuf || !normbuf || !mixbuf || !prebuf || !xbuf ||
+            ds4_gpu_tensor_bytes(split) < mix_bytes ||
+            ds4_gpu_tensor_bytes(mix) < mix_bytes ||
+            ds4_gpu_tensor_bytes(pre) < (uint64_t)n_hc * sizeof(float) ||
+            ds4_gpu_tensor_bytes(residual_hc) < row_bytes * n_hc ||
+            ds4_gpu_tensor_bytes(x_out) < row_bytes ||
+            ds4_gpu_tensor_bytes(norm_out) < row_bytes) return 0;
+        uint64_t scale_inner = 0, base_inner = 0, norm_inner = 0;
+        id<MTLBuffer> scalebuf = ds4_gpu_wrap_model_range(model_map, model_size, scale_offset,
+                                                          3ull * sizeof(float), &scale_inner);
+        id<MTLBuffer> basebuf = ds4_gpu_wrap_model_range(model_map, model_size, base_offset,
+                                                         mix_bytes, &base_inner);
+        id<MTLBuffer> normwbuf = ds4_gpu_wrap_model_range(model_map, model_size, norm_offset,
+                                                          row_bytes, &norm_inner);
+        if (!scalebuf || !basebuf || !normwbuf) return 0;
+        const struct {
+            uint32_t n_embd;
+            int32_t sinkhorn_iters;
+            float hc_eps, norm_eps;
+        } args = { n_embd, (int32_t)sinkhorn_iters, hc_eps, norm_eps };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:mixbuf offset:ds4_gpu_tensor_offset(mix) atIndex:1];
+        [enc setBuffer:scalebuf offset:(NSUInteger)scale_inner atIndex:2];
+        [enc setBuffer:basebuf offset:(NSUInteger)base_inner atIndex:3];
+        [enc setBuffer:prebuf offset:ds4_gpu_tensor_offset(pre) atIndex:4];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(residual_hc) atIndex:5];
+        [enc setBuffer:splitbuf offset:ds4_gpu_tensor_offset(split) atIndex:6];
+        [enc setBuffer:xoutbuf offset:ds4_gpu_tensor_offset(x_out) atIndex:7];
+        [enc setBuffer:normwbuf offset:(NSUInteger)norm_inner atIndex:8];
+        [enc setBuffer:normbuf offset:ds4_gpu_tensor_offset(norm_out) atIndex:9];
+        [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "V4.1 fused HC-pre tail")) return 0;
+    }
+    return 1;
+}
+
 int ds4_gpu_router_select_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,
@@ -45205,7 +45285,10 @@ int ds4_gpu_hc_rms_norm_mix_f16_tensor(
         uint32_t              out_dim,
         float                 eps) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!out || !x || !model_map || n != 16384u || out_dim != 24u) return 0;
+    /* The replayed trees assume 1024 RMSNorm threads (n >= 4096), the
+     * 8-simdgroup plain matvec and an empty scalar tail (n % 32 == 0):
+     * V4 (16384) and V4.1 (20480). */
+    if (!out || !x || !model_map || n < 4096u || n % 32u != 0 || out_dim != 24u) return 0;
 
     @autoreleasepool {
         const uint64_t row_bytes = (uint64_t)n * sizeof(uint16_t);
